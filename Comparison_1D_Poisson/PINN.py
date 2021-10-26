@@ -4,7 +4,8 @@ import numpy as np
 from scipy import integrate
 from scipy.interpolate import InterpolatedUnivariateSpline as IUS
 from scipy.interpolate import interp1d
-from scipy.interpolate import splrep, splev, splder
+import time
+
 
 from dolfin import *
 
@@ -51,9 +52,8 @@ def rescale(x, lb, ub):
 
     return z
 
-# the deep neural network
 
-
+# The deep neural network
 class DNN(torch.nn.Module):
 
     # layers count the hiddens + the output
@@ -67,7 +67,7 @@ class DNN(torch.nn.Module):
         self.ub = ub
         self.activation = nn.LeakyReLU()
         #self.activation = nn.Softplus()
-
+        self.time = 0
         # set up layer order dict
         self.layers = torch.nn.ModuleList()
         self.activations = torch.nn.ModuleList()
@@ -101,7 +101,6 @@ class DNN(torch.nn.Module):
 
 def init_weights(m):
     with torch.no_grad():
-        # 0.01 for this time
         if type(m) == torch.nn.Linear:
             m.weight.normal_(1, 0.1)
             m.bias.normal_(0, 0.1)
@@ -121,14 +120,16 @@ class PhysicsInformedNN():
         self.xi = torch.tensor(xi, requires_grad=True).float().to(
             self.device).unsqueeze(-1)
         self.layers = layers
-        self.X_prev = np.linspace(0, 1, self.N)
         self.u = u
         self.k = k
         self.m = m
         self.relErr = relErr
+        self.max_it = max_it
+        self.path_model = path_model
         # neural net
         self.loss = []
         self.lr = lr
+
         if net == []:
             self.dnn = DNN(self.layers, self.lb, self.ub).to(self.device)
             # manual_seed works only with CUDA
@@ -137,51 +138,25 @@ class PhysicsInformedNN():
         else:
             print('net loaded')
             self.dnn = net
-        self.max_it = max_it
-        self.path_model = path_model
-
-        # optimizers: using the same settings
-        #self.optimizer = torch.optim.RMSprop(self.dnn.parameters(), lr=1e-5)
+        # optimizers:
 
         # works well when the first/second order derivative is computed analitycally
         #self.optimizer = torch.optim.Adadelta(self.dnn.parameters(), lr=0.1)
 
         # works well when the first/second order derivative is approximated
-        # 0.1 default
         self.optimizer = torch.optim.Adam(self.dnn.parameters(), lr=self.lr)
-        #self.optimizer = torch.optim.LBFGS(self.dnn.parameters(), lr=0.1)
         self.iter = 0
 
-    def avg_derivative(self, h, x, u, X_prev):
+    def avg_derivative(self, h, x, u):
         """ Compute first/second order derivative of u"""
 
-        ## compute analitycally the first derivative  ###
-        # for i,v in enumerate(x):
-        #   u[i] = 10*mp.sech(10*v)**2
-
-        ## compute analitycally the second derivative ###
-        # for i,v in enumerate(x):
-        #    u[i] = -200*(mp.sech(10*v + 1e-6)**2)*np.tanh(10*v)
-        # print(x)
         X = x.detach().cpu().numpy()
-        # print(X)
-        #X = rescale_(X, self.lb, self.ub, self.iter)
         X = np.array(sorted(X))
 
         H = h.detach().cpu().numpy()
         H = sorted(H)
 
         Y = u.detach().cpu().numpy()
-        iterc = 0
-        if not np.all(np.diff(X) >= 0.0):
-            # find indexes of colliding points
-            #idxs = np.where(np.diff(X) == 0.0)
-            # print(np.diff(X))
-            # print(X)
-            print('colliding points')
-            X = X_prev
-            #rescale_(X, self.lb, self.ub, iterc)
-
         u_interp = IUS(X, Y)
         u_x = u_interp.derivative()
         f = u_x.derivative()
@@ -197,8 +172,9 @@ class PhysicsInformedNN():
 
         res = torch.tensor(res).float().to(self.device)
 
-        return res, X
+        return res
 
+    # Not needed in practice
     def optimal_alpha(self, h, u_xx):
 
         Sum = torch.sum(h*u_xx**(1/(1+2*(self.k-self.m+1))))
@@ -214,8 +190,7 @@ class PhysicsInformedNN():
         h = torch.sort(h)[0]
         h = h[1:] - h[:-1]
         u = self.u(x)
-        u_xx, self.X_prev = self.avg_derivative(h, x, u, self.X_prev)
-        #alpha = self.optimal_alpha(h,u_xx)
+        u_xx = self.avg_derivative(h, x, u)
         alpha = 1
         f = h*torch.pow(1 + 1/alpha*u_xx, 1/(1+2*(self.k-self.m+1)))
         f = torch.pow(f, 1+2*(self.k-self.m+1))
@@ -226,39 +201,47 @@ class PhysicsInformedNN():
 
         self.optimizer.zero_grad()
         f, alpha = self.net_equid(self.N, self.xi)
-        Loss = ((self.N-1)**(2*(self.k-self.m+1)))*alpha*torch.sum(f)
+        loss = ((self.N-1)**(2*(self.k-self.m+1)))*alpha*torch.sum(f)
 
-        if Loss > 0:
-            self.loss.append(Loss)
-            Loss.backward()
-        print('Iter %d, Loss: %.5e' % (self.iter, Loss.item()))
-        return Loss
+        if loss > 0:
+            self.loss.append(loss.item())
+            loss.backward()
+        print('Iter %d, Loss: %.5e' % (self.iter, loss.item()))
+        return loss
 
     def get_loss(self):
         return self.loss
 
     def train(self):
 
+        t0 = time.time()
         while self.iter < self.max_it:
 
             self.dnn.train()
             self.iter += 1
             # Backward and optimize
+            self.optimizer.param_groups[0]['lr'] = self.lr * \
+                10**(-np.log10(1+self.iter/100))
             self.optimizer.step(self.loss_func)
 
             relErr = 100
             if self.iter > 2:
-                relErr = np.abs(self.loss[-1].item() -
-                                self.loss[-2].item())/(self.loss[-2].item())
+                relErr = np.abs(self.loss[-1]-self.loss[-2])/(self.loss[-2])
 
-            if self.iter % 500 == 0:
+            if self.iter % (self.max_it//5) == 0:
                 self.dnn.save(self.path_model, self.iter)
+                np.save(f'./Loss/loss_{self.iter}.npy', self.loss)
+                np.save(f'./Time/time_{self.iter}.npy', time.time() - t0)
 
             if relErr < self.relErr:
                 self.dnn.save(self.path_model, self.iter)
+                np.save(f'./Loss/loss_{self.iter}.npy', self.loss)
+                np.save(f'./Time/time_{self.iter}.npy', time.time() - t0)
                 return
 
         self.dnn.save(self.path_model, self.iter)
+        np.save(f'./Loss/loss_{self.iter}.npy', self.loss)
+        np.save(f'./Time/time_{self.iter}.npy', time.time() - t0)
         return
 
     def predict(self, Xi):
@@ -271,24 +254,7 @@ class PhysicsInformedNN():
         return p
 
 
-def convRate(model, a, b, Nvec, u, equid=True):
-    Errvec = np.zeros_like(Nvec)
-    rate = np.zeros_like(Nvec[:-1])
-    for i, N in enumerate(Nvec):
-        x = np.linspace(a, b, N)
-        if not equid:
-            x = model.predict(x).detach().cpu().numpy()
-        y = u(x)
-        f_interp = interp1d(x, y)
-        err = integrate.quad(lambda x: (u(x) - f_interp(x))
-                             ** 2, a, b, epsabs=0)[0]
-        Errvec[i] = np.sqrt(err)
-
-    rate = np.log(Errvec[:-1]/Errvec[1:])/np.log(Nvec[1:]/Nvec[:-1])
-    return rate, Errvec
-
-
-def convRate_fenics(model, a, b, Nvec, U, equid=True):
+def convRate(model, a, b, Nvec, U, equid=True):
     Errvec = np.zeros_like(Nvec)
     rate = np.zeros_like(Nvec[:-1])
 
@@ -311,3 +277,19 @@ def convRate_fenics(model, a, b, Nvec, U, equid=True):
 
     rate = np.log(Errvec[:-1]/Errvec[1:])/np.log(Nvec[1:]/Nvec[:-1])
     return rate, Errvec
+
+
+# def convRate(model, a, b, Nvec, u, equid=True):
+#     Errvec = np.zeros_like(Nvec)
+#     rate = np.zeros_like(Nvec[:-1])
+#     for i, N in enumerate(Nvec):
+#         x = np.linspace(a, b, N)
+#         if not equid:
+#             x = model.predict(x).detach().cpu().numpy()
+#         y = u(x)
+#         f_interp = interp1d(x, y)
+#         err = integrate.quad(lambda x: (u(x) - f_interp(x))
+#                              ** 2, a, b, epsabs=0)[0]
+#         Errvec[i] = np.sqrt(err)
+#     rate = np.log(Errvec[:-1]/Errvec[1:])/np.log(Nvec[1:]/Nvec[:-1])
+#     return rate, Errvec

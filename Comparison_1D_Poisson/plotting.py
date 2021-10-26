@@ -26,9 +26,18 @@ for folder_name in folder_names:
     path_data = path + folder_name
     data.append(np.load(path_data + f'/{folder_name[1:]}.npz'))
 
-folder_name = '/DNN/N_300_H_256_depth_15'
+#folder_name = '/DNN/N_300_H_256_depth_15'
+folder_name = '/DNN/N_300_H_20_depth_5'
 path_data = path + folder_name
 data.append(np.load(path_data + f'/DNN.npz'))
+
+time = []
+
+iter = [1000, 2000, 3000, 4000]
+
+for i in iter:
+    time.append(np.load(path_data + f'/Time/time_{i}.npy'))
+loss = np.load(path_data + f'/Loss.npy')
 
 
 dim_post = data[0]['dim']
@@ -53,11 +62,21 @@ L2err_unif = data[3]['L2err']
 hmin_unif = data[3]['hmin']
 time_unif = data[3]['time']
 
-
 dim_DNN = data[4]['Nvec']
 L2err_DNN = data[4]['Errvec']
 rate_DNN = data[4]['rate']
 
+# plot loss
+plt.figure()
+plt.loglog(loss)
+plt.xlabel('iteration')
+plt.ylabel('loss function')
+
+# plot time training network
+plt.figure()
+plt.plot(iter, time, 'k.-')
+plt.xlabel('iteration')
+plt.ylabel('time GPU training')
 
 # plot difference in time
 plt.figure()
@@ -93,6 +112,5 @@ plt.xlabel('N')
 plt.ylabel('L2-error')
 plt.yscale('log')
 plt.xscale('log')
-plt.xlim((0, 10**4))
 plt.legend()
 plt.show()
