@@ -1,25 +1,12 @@
-from genericpath import exists
 import torch
 from torch import nn
 import numpy as np
 from scipy import integrate
-from scipy.interpolate import InterpolatedUnivariateSpline as IUS
 from scipy.interpolate import interp1d
-#from scipy.interpolate import splrep, splev, splder
 from dolfin import *
 from collections import OrderedDict
 import time
 import os
-
-
-class softplus_power(nn.Module):
-    def __init(self):
-        super.__init__()
-
-    def forward(self, x):
-        m = nn.Softplus()
-        x = m(x)
-        return x**1.2
 
 
 # The deep neural network
@@ -32,7 +19,7 @@ class DNN(torch.nn.Module):
 
        # parameters
         self.depth = len(layers) - 1
-        self.dropout = torch.nn.Dropout(0.1)
+        #self.dropout = torch.nn.Dropout(0.1)
         # set up layer order dict
         self.activation = torch.nn.Tanh
 
@@ -58,7 +45,7 @@ class DNN(torch.nn.Module):
 
     def save(self, path_model, iter):
         # Python dictionary object that maps each layer to its parameter tensor.
-        torch.save(self.state_dict(), path_model + f'/DNN_{iter}.pth')
+        torch.save(self.state_dict(), path_model + f'/DNN/DNN_{iter}.pth')
 
     def load(self, path):
         # load the parameters from pth file
@@ -66,8 +53,6 @@ class DNN(torch.nn.Module):
 
 
 class PINN():
-
-    # Solve 1D Poisson equation using Fenics with DB conditions
 
     def __init__(self, X, f, layers, ul, ur, device, path_model, batch_size=100, max_it=1000, lr=0.1, relErr=1e-8, net=[]):
 
@@ -93,7 +78,7 @@ class PINN():
             self.dnn = DNN(self.layers).to(self.device)
             # manual_seed works only with CUDA
             torch.manual_seed(1234)
-            # self.dnn.apply(init_weights)
+            self.dnn.apply(init_weights)
         else:
             print('net loaded')
             self.dnn = net
@@ -101,12 +86,11 @@ class PINN():
         self.max_it = max_it
         self.path_model = path_model
         self.iter = 0
-        # optimizers: using the same settings
+
+        # optimizers
+
         # self.optimizer = torch.optim.RMSprop(self.dnn.parameters(), lr=1e-5)
-        # works well when the first/second order derivative is computed analitycally
         #self.optimizer = torch.optim.Adadelta(self.dnn.parameters(), lr=0.1)
-        # works well when the first/second order derivative is approximated
-        # 0.1 default
         self.optimizer = torch.optim.Adam(self.dnn.parameters(), lr=self.lr)
         #self.optimizer = torch.optim.SGD(self.dnn.parameters(), lr=self.lr)
         # self.optimizer = torch.optim.LBFGS(
@@ -123,32 +107,50 @@ class PINN():
     def loss_func(self):
 
         self.optimizer.zero_grad()
-        u = self.dnn(self.x_train)
+        u = self.dnn(self.x)
 
         u_x = torch.autograd.grad(
-            u, self.x_train,
+            u, self.x,
             grad_outputs=torch.ones_like(u),
             retain_graph=True,
             create_graph=True
         )[0]
 
         u_xx = torch.autograd.grad(
-            u_x, self.x_train,
+            u_x, self.x,
             grad_outputs=torch.ones_like(u_x),
             retain_graph=True,
             create_graph=True
         )[0]
 
-        u_xx = u_xx.squeeze(-1)
+        u_xxx = torch.autograd.grad(
+            u_xx, self.x,
+            grad_outputs=torch.ones_like(u_x),
+            retain_graph=True,
+            create_graph=True
+        )[0]
+
         u = u.squeeze(-1)
+        u_xx = u_xx.squeeze(-1)
+        u_xxx = u_xxx.squeeze(-1)
 
-        loss_f = torch.mean((self.f_train + u_xx)**2)
-        loss_boundary = (u[0] - self.ul)**2 + (u[-1] - self.ur)**2
+        cr = 1
+        Cr = 1
+        Kr = Cr/cr
+        alpha = 1
+        mr = self.x.shape[0]
+        # value between 0 and 1
+        lambda_R = (Cr**(-2*alpha)/Kr)*mr**(-alpha-0.5)
+        regularizer = torch.max(torch.abs(u_xxx))**2
+        loss_f = torch.mean((self.f + u_xx)**2)
+        loss_boundary = 0.5*(u[0] - self.ul)**2 + (u[-1] - self.ur)**2
 
-        loss = loss_f + loss_boundary
-
-        self.loss.append(loss)
+        loss = loss_f + loss_boundary + lambda_R*regularizer
         loss.backward()
+
+        if self.iter % 2000 == 0:
+            self.loss.append(loss.item())
+
         print('Iter %d, Loss: %.5e, Loss_boundary: %.5e, Loss_f: %.5e' %
               (self.iter, loss.item(), loss_boundary.item(), loss_f.item()))
         return loss
@@ -156,59 +158,55 @@ class PINN():
     def get_loss(self):
         return self.loss
 
+    def L2error(self, mesh, X, CG1, d2v, u_expr):
+        U = self.predict(X).detach().cpu().numpy().flatten()
+        u = Function(CG1)
+        u.vector()[d2v] = U
+        err = assemble((u_expr*u_expr + u*u - 2*u_expr*u)
+                       * dx(mesh), form_compiler_parameters={"quadrature_degree": 1})
+
+        return err
+
     def train(self):
         # Construct update mesh with new coordinates
         np.random.seed(1234)
-        idxs = np.arange(1, self.N-1)
-        os.makedirs(self.path_model + '/Time', exist_ok=True)
-        os.makedirs(self.path_model + '/Loss', exist_ok=True)
+        a = -1
+        b = 1
+        mesh = UnitIntervalMesh(10**4)
+        mesh.coordinates()[:] = mesh.coordinates()[:]*(b-a) + a
+        CG1 = FunctionSpace(mesh, 'CG', 1)
+        d2v = dof_to_vertex_map(CG1)
+        u_expr = Expression('sin(pi*x[0])', degree=5)
+        X = torch.tensor(mesh.coordinates()[:]).float().to(self.device)
 
+        os.makedirs(self.path_model + '/Var', exist_ok=True)
+        os.makedirs(self.path_model + '/DNN', exist_ok=True)
         t0 = time.time()
-
         while self.iter < self.max_it:
-            # Take a random sample of the entire dataset
-            # idxs_train = np.random.choice(
-            #     idxs, size=self.batch_size, replace=False)
-            # idxs_train = np.concatenate((0, idxs_train, self.N-1), axis=None)
-            #idxs_valid = list(set(idxs) - set(idxs_train))
-
-            self.x_train = self.x
-            self.f_train = self.f
-
-            #self.x_valid = self.x[idxs_valid, :]
-            #self.f_valid = self.f[idxs_valid, :]
 
             self.dnn.train()
             self.iter += 1
             # self.optimizer.param_groups[0]['lr'] = self.lr * \
-            #   10**(-np.log10(1+self.iter/100))
+            #     np.exp(-self.iter/(5*10**3))
+            # self.lr * \
+            #     10**(-np.log10(1+self.iter/1000))
 
             # Backward and optimize
             self.optimizer.step(self.loss_func)
 
-            if self.iter > 1:
-                relErr = np.abs(self.loss[-1].item() -
-                                self.loss[-2].item())/(self.loss[-2].item())
-            else:
-                relErr = 1
-
             if self.iter % 2000 == 0:
                 self.dnn.save(self.path_model, self.iter)
-                np.save(self.path_model +
-                        f'/Time/time_{self.iter}.npy', time.time() - t0)
-                np.save(self.path_model +
-                        f'/Loss/Loss_{self.iter}.npy', self.loss)
+                L2err = self.L2error(mesh, X, CG1, d2v, u_expr)
+                np.savez(self.path_model + f'/Var/vars_{self.iter}.npz', time=time.time() - t0, loss=self.loss,
+                         err=L2err, lr=self.optimizer.param_groups[0]['lr'])
+                relErr = np.abs(self.loss[-1]-self.loss[-2]) / \
+                    self.loss[-2] if len(self.loss) > 1 else 1
+                if relErr < self.relErr:
+                    return
 
-            if relErr < self.relErr:
-                self.dnn.save(self.path_model, self.iter)
-                np.save(self.path_model +
-                        f'/Time/time.npy', time.time() - t0)
-                np.save(self.path_model + '/Loss.npy', self.loss)
-                return
-
-        np.save(self.path_model +
-                f'/Time/time.npy', time.time() - t0)
-        np.save(self.path_model + '/Loss.npy', self.loss)
+        L2err = self.L2error(mesh, X, CG1, d2v, u_expr)
+        np.savez(self.path_model + f'/Var/vars_{self.iter}.npz', time=time.time(
+        ) - t0, loss=self.loss, rate=L2err, lr=self.optimizer.param_groups[0]['lr'])
         self.dnn.save(self.path_model, self.iter)
         return
 
@@ -218,6 +216,12 @@ class PINN():
         u = self.dnn(X)
         u.detach().cpu().squeeze().numpy()
         return u
+
+
+def init_weights(m):
+    if type(m) == torch.nn.Linear:
+        nn.init.xavier_normal_(m.weight.data)
+        m.bias.data.zero_()
 
 
 def convRate(model, a, b, Nvec, device):
